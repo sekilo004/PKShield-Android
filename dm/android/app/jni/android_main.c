@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
+#include <malloc.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <dirent.h>
@@ -36,12 +38,15 @@
 int dm_main(int argc, char **argv);   // dm/host/main.c built with -Dmain=dm_main
 void dm_focus_set(int st);
 void dm_audio_suspend(int on);
+void guest_clock_freeze_for(int reason, int on);
+void dm_gfx_suspend(int on);
 #define ALOG(...) __android_log_print(ANDROID_LOG_INFO, "nxnative", __VA_ARGS__)
 
 static struct android_app *g_app;
 static _Atomic(ANativeWindow *) g_window;
+static _Atomic int g_paused;
 static char g_files[1024], g_game[1024];
-void *front_metal_layer(void) { return atomic_load(&g_window); }   // the window the Vulkan replay presents to (the name is the Apple front ends' interface)
+void *front_metal_layer(void) { return atomic_load(&g_paused) ? NULL : atomic_load(&g_window); }   // the window the Vulkan replay presents to (NULL while paused in the background)
 void *front_android_window(void) { return atomic_load(&g_window); }
 // The game's keyboard (its name entry): the app's Android dialog (app/java/com/nxnative/TextInput.java) with the phone's keyboard, on the UI thread; this game thread
 // waits for it (hle_swkbd.c stops the game's clock meanwhile). 1 OK (out holds the text, UTF-8), 0 cancelled, -1 no dialog (then the game takes it as cancelled)
@@ -107,13 +112,81 @@ static void pads_merge(void) {
         g_pad_lx = strongest(g_pad_lx, g_pads[i].lx); g_pad_ly = strongest(g_pad_ly, g_pads[i].ly); g_pad_rx = strongest(g_pad_rx, g_pads[i].rx); g_pad_ry = strongest(g_pad_ry, g_pads[i].ry); }
     dm_pad_set(g_pad_btn, g_pad_lx, g_pad_ly, g_pad_rx, g_pad_ry);
 }
-static uint64_t key_bit(int32_t kc) {
-    switch (kc) {   // face buttons by letter, as the controller labels them (A = the bottom button on Xbox-style pads is AKEYCODE_BUTTON_A)
-        case AKEYCODE_BUTTON_A: return DM_BTN_B; case AKEYCODE_BUTTON_B: return DM_BTN_A; case AKEYCODE_BUTTON_X: return DM_BTN_Y; case AKEYCODE_BUTTON_Y: return DM_BTN_X;
-        case AKEYCODE_BUTTON_L1: return DM_BTN_L; case AKEYCODE_BUTTON_R1: return DM_BTN_R; case AKEYCODE_BUTTON_L2: return DM_BTN_ZL; case AKEYCODE_BUTTON_R2: return DM_BTN_ZR;
-        case AKEYCODE_BUTTON_THUMBL: return DM_BTN_LS; case AKEYCODE_BUTTON_THUMBR: return DM_BTN_RS; case AKEYCODE_BUTTON_START: return DM_BTN_PLUS; case AKEYCODE_BUTTON_SELECT: return DM_BTN_MINUS;
-        case AKEYCODE_DPAD_UP: return DM_BTN_UP; case AKEYCODE_DPAD_DOWN: return DM_BTN_DOWN; case AKEYCODE_DPAD_LEFT: return DM_BTN_LEFT; case AKEYCODE_DPAD_RIGHT: return DM_BTN_RIGHT;
+#define KC_MAP_SIZE 512
+static uint64_t g_kc_map[KC_MAP_SIZE];
+static int g_pad_map_inited;
+
+typedef struct { const char *name; uint64_t bit; int32_t def_kc; } pad_btn_def_t;
+static const pad_btn_def_t PAD_BTNS[] = {
+    { "A",     DM_BTN_A,     AKEYCODE_BUTTON_B },
+    { "B",     DM_BTN_B,     AKEYCODE_BUTTON_A },
+    { "X",     DM_BTN_X,     AKEYCODE_BUTTON_Y },
+    { "Y",     DM_BTN_Y,     AKEYCODE_BUTTON_X },
+    { "L",     DM_BTN_L,     AKEYCODE_BUTTON_L1 },
+    { "R",     DM_BTN_R,     AKEYCODE_BUTTON_R1 },
+    { "ZL",    DM_BTN_ZL,    AKEYCODE_BUTTON_L2 },
+    { "ZR",    DM_BTN_ZR,    AKEYCODE_BUTTON_R2 },
+    { "LS",    DM_BTN_LS,    AKEYCODE_BUTTON_THUMBL },
+    { "RS",    DM_BTN_RS,    AKEYCODE_BUTTON_THUMBR },
+    { "PLUS",  DM_BTN_PLUS,  AKEYCODE_BUTTON_START },
+    { "MINUS", DM_BTN_MINUS, AKEYCODE_BUTTON_SELECT },
+    { "UP",    DM_BTN_UP,    AKEYCODE_DPAD_UP },
+    { "DOWN",  DM_BTN_DOWN,  AKEYCODE_DPAD_DOWN },
+    { "LEFT",  DM_BTN_LEFT,  AKEYCODE_DPAD_LEFT },
+    { "RIGHT", DM_BTN_RIGHT, AKEYCODE_DPAD_RIGHT },
+};
+
+static void pad_map_init(void) {
+    memset(g_kc_map, 0, sizeof g_kc_map);
+    const char *layout = getenv("DM_PAD_LAYOUT");
+    int nintendo = layout && !strcmp(layout, "nintendo");
+
+    for (size_t i = 0; i < sizeof(PAD_BTNS) / sizeof(PAD_BTNS[0]); i++) {
+        int32_t kc = PAD_BTNS[i].def_kc;
+        if (nintendo) {
+            if (PAD_BTNS[i].bit == DM_BTN_A) kc = AKEYCODE_BUTTON_A;
+            else if (PAD_BTNS[i].bit == DM_BTN_B) kc = AKEYCODE_BUTTON_B;
+            else if (PAD_BTNS[i].bit == DM_BTN_X) kc = AKEYCODE_BUTTON_X;
+            else if (PAD_BTNS[i].bit == DM_BTN_Y) kc = AKEYCODE_BUTTON_Y;
+        }
+        if (kc >= 0 && kc < KC_MAP_SIZE) g_kc_map[kc] |= PAD_BTNS[i].bit;
     }
+
+    const char *map = getenv("DM_PAD_MAPPING");
+    if (map && *map) {
+        char buf[512];
+        strncpy(buf, map, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = 0;
+        char *saveptr = NULL;
+        char *tok = strtok_r(buf, ", ", &saveptr);
+        while (tok) {
+            char *sep = strchr(tok, ':');
+            if (!sep) sep = strchr(tok, '=');
+            if (sep) {
+                *sep = 0;
+                char *btn_name = tok;
+                int kc = atoi(sep + 1);
+                for (size_t i = 0; i < sizeof(PAD_BTNS) / sizeof(PAD_BTNS[0]); i++) {
+                    if (!strcasecmp(btn_name, PAD_BTNS[i].name)) {
+                        for (int k = 0; k < KC_MAP_SIZE; k++) {
+                            g_kc_map[k] &= ~PAD_BTNS[i].bit;
+                        }
+                        if (kc >= 0 && kc < KC_MAP_SIZE) {
+                            g_kc_map[kc] |= PAD_BTNS[i].bit;
+                        }
+                        break;
+                    }
+                }
+            }
+            tok = strtok_r(NULL, ", ", &saveptr);
+        }
+    }
+    g_pad_map_inited = 1;
+}
+
+static uint64_t key_bit(int32_t kc) {
+    if (!g_pad_map_inited) pad_map_init();
+    if (kc >= 0 && kc < KC_MAP_SIZE) return g_kc_map[kc];
     return 0;
 }
 static int32_t axis(float v) { if (fabsf(v) < 0.12f) return 0; float s = (fabsf(v) - 0.12f) / 0.88f; if (s > 1) s = 1; return (int32_t)(copysignf(s, v) * DM_STICK_MAX); }
@@ -150,7 +223,10 @@ static int32_t on_input(struct android_app *app, AInputEvent *e) {
         float lt = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_LTRIGGER, 0), rt = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_RTRIGGER, 0);
         if (lt == 0) lt = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_BRAKE, 0); if (rt == 0) rt = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_GAS, 0);
         touch_ui_hide();
-        g_pads[k].hat = (hx < -0.5f ? DM_BTN_LEFT : 0) | (hx > 0.5f ? DM_BTN_RIGHT : 0) | (hy < -0.5f ? DM_BTN_UP : 0) | (hy > 0.5f ? DM_BTN_DOWN : 0) | (lt > 0.5f ? DM_BTN_ZL : 0) | (rt > 0.5f ? DM_BTN_ZR : 0);
+        uint64_t b_lt = key_bit(AKEYCODE_BUTTON_L2), b_rt = key_bit(AKEYCODE_BUTTON_R2);
+        uint64_t b_du = key_bit(AKEYCODE_DPAD_UP), b_dd = key_bit(AKEYCODE_DPAD_DOWN);
+        uint64_t b_dl = key_bit(AKEYCODE_DPAD_LEFT), b_dr = key_bit(AKEYCODE_DPAD_RIGHT);
+        g_pads[k].hat = (hx < -0.5f ? b_dl : 0) | (hx > 0.5f ? b_dr : 0) | (hy < -0.5f ? b_du : 0) | (hy > 0.5f ? b_dd : 0) | (lt > 0.5f ? b_lt : 0) | (rt > 0.5f ? b_rt : 0);
         pads_merge(); return 1;
     }
     if (type == AINPUT_EVENT_TYPE_MOTION && (src & AINPUT_SOURCE_TOUCHSCREEN)) { touch_update(e); return 1; }
@@ -166,10 +242,43 @@ static void env_file(const char *path) {   // KEY=VALUE lines, # comments; set o
     fclose(f);
 }
 static pid_t g_game_tid;   // the game's main thread (performance hints below)
+// DM_CPU_PIN=1 (settings screen, off by default): the game's main thread, and the threads it starts (a thread keeps its creator's CPU set), stay off the slowest cores of the
+// phone. A scheduler that parks the render / game thread on a small core halves the frame rate for a moment. The cores are told apart by cpu_capacity, or the top frequency when
+// the phone does not show it; a phone whose cores are all alike, or whose files cannot be read, is left alone
+#include <sys/syscall.h>
+static long kb_of(const char *path, const char *key);   // below: the first number of the line that starts with key (an empty key: the file's first line)
+static long cpu_speed(int c) {
+    char p[96]; static const char *const f[2] = { "cpu%d/cpu_capacity", "cpu%d/cpufreq/cpuinfo_max_freq" };
+    for (int k = 0; k < 2; k++) { char n[64]; snprintf(n, sizeof n, f[k], c); snprintf(p, sizeof p, "/sys/devices/system/cpu/%s", n);
+        long v = kb_of(p, ""); if (v > 0) return v; }
+    return -1;
+}
+static void pin_fast_cores(void) {
+    const char *e = getenv("DM_CPU_PIN"); if (!e || !atoi(e)) return;
+    int n = (int)sysconf(_SC_NPROCESSORS_CONF); if (n < 2 || n > 64) return;
+    long sp[64], lo = 1L << 60, hi = 0;
+    for (int c = 0; c < n; c++) { sp[c] = cpu_speed(c); if (sp[c] <= 0) { ALOG("cpu pin: core %d speed unknown, left alone", c); return; } if (sp[c] < lo) lo = sp[c]; if (sp[c] > hi) hi = sp[c]; }
+    if (lo == hi) { ALOG("cpu pin: all cores alike, left alone"); return; }
+    uint64_t mask = 0; for (int c = 0; c < n; c++) if (sp[c] > lo) mask |= 1ull << c;
+    long r = syscall(__NR_sched_setaffinity, 0, sizeof mask, &mask);
+    fprintf(stderr, "[cpu] game thread kept off the %d slowest cores: mask %#llx (%s)\n", n - __builtin_popcountll(mask), (unsigned long long)mask, r ? "failed" : "ok");
+}
 static void *host_thread(void *a) {
     g_game_tid = gettid();
+    pin_fast_cores();
     (void)a; static char alt[65536]; stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
-    char patched[1100]; snprintf(patched, sizeof patched, "%s/patched", g_game);
+    const char *ver = getenv("DM_GAME_VERSION");
+    if (!ver || !*ver) ver = getenv("DM_VERSION");
+    const char *tag = (ver && !strcasecmp(ver, "sword")) ? "sword" : "shield";
+    char patched[1100];
+    struct stat pst;
+    char fixup[1200];
+    snprintf(fixup, sizeof fixup, "%s/patched_%s/main.fixups.tsv", g_game, tag);
+    if (!stat(fixup, &pst)) {
+        snprintf(patched, sizeof patched, "%s/patched_%s", g_game, tag);
+    } else {
+        snprintf(patched, sizeof patched, "%s/patched", g_game);
+    }
     char *argv[3] = { "dmhost", patched, NULL };
     int rc = dm_main(2, argv);
     fprintf(stderr, "boot: dm_main returned %d\n", rc);
@@ -222,7 +331,10 @@ static void *log_mirror(void *p) {
         graphics_auto();
         if (n % 6 == 0) fprintf(stderr, "[mem] app %ld MB resident (%ld MB swapped), phone %ld MB available of %ld MB; heat %s\n", kb_of("/proc/self/status", "VmRSS:") / 1024,
                                 kb_of("/proc/self/status", "VmSwap:") / 1024, kb_of("/proc/meminfo", "MemAvailable:") / 1024, kb_of("/proc/meminfo", "MemTotal:") / 1024, thermal_text(th, sizeof th));
-        copy_file(src, DL "/PokemonShield-log.txt");
+        const char *ver = getenv("DM_GAME_VERSION");
+        if (!ver || !*ver) ver = getenv("DM_VERSION");
+        int is_sword = ver && !strcasecmp(ver, "sword");
+        copy_file(src, is_sword ? DL "/PokemonSword-log.txt" : DL "/PokemonShield-log.txt");
     }
     return NULL;
 }
@@ -285,16 +397,23 @@ static void host_start(void) {
     char p[1200], q[1200];
     snprintf(p, sizeof p, "%s/log.txt", g_files); snprintf(q, sizeof q, "%s/log.prev.txt", g_files); rename(p, q);
     if (freopen(p, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
-    copy_file(q, DL "/PokemonShield-log-previous.txt");
+    snprintf(p, sizeof p, "%s/env.txt", g_files); env_file(p);
+    pad_map_init();
+    const char *ver = getenv("DM_GAME_VERSION");
+    if (!ver || !*ver) ver = getenv("DM_VERSION");
+    int is_sword = ver && !strcasecmp(ver, "sword");
+    const char *tag = is_sword ? "sword" : "shield";
+    copy_file(q, is_sword ? DL "/PokemonSword-log-previous.txt" : DL "/PokemonShield-log-previous.txt");
     { pthread_t lt; if (!pthread_create(&lt, NULL, log_mirror, NULL)) pthread_detach(lt); }
     { pthread_t it; if (!pthread_create(&it, NULL, inspector_main, NULL)) pthread_detach(it); }   // the memory inspector (scan.req / peek.req)
-    snprintf(p, sizeof p, "%s/env.txt", g_files); env_file(p);
     // Game files: inside the installed APKs (the all-in-one .apks bundle, read through apkfs.c as /nxapk/...), else copied into the files folder
     struct stat st; int inapk = !stat("/nxapk/RomFS", &st);
     snprintf(g_game, sizeof g_game, "%s", inapk ? "/nxapk" : g_files);
     #define SETG(k, sub) do { snprintf(p, sizeof p, "%s/%s", g_game, sub); setenv(k, p, 0); } while (0)
     #define SETP(k, sub) do { snprintf(p, sizeof p, "%s/%s", g_files, sub); setenv(k, p, 0); } while (0)
     setenv("DM_AUDIO", "1", 0);
+    if (is_sword) setenv("DM_PROGRAM_ID", "0100abf008968000", 0);
+    else setenv("DM_PROGRAM_ID", "01008db008c2c000", 0);
     // graphics (the app's settings screen): high = the console's TV mode (1080p, full effects), low = handheld mode (720p, the game's own lighter settings),
     // auto = TV mode, switched to handheld while the phone is hot (graphics_auto below). DM_OPMODE in env.txt still wins
     { const char *g = getenv("DM_GRAPHICS"); if (g && !strcmp(g, "low")) setenv("DM_OPMODE", "0", 0); else if (g && (!strcmp(g, "high") || !strcmp(g, "auto"))) setenv("DM_OPMODE", "1", 0); }
@@ -303,16 +422,38 @@ static void host_start(void) {
 #endif   // real sound output (AAudio, compat/aaudio_unit.c); env.txt can set 0
     // pipelines: every one the game makes is recorded here and built ahead at the next start, the list shipped with the game too, and the driver's compiled code kept
     SETP("DM_VK_PSO_RECORD", "vk_pipelines.bin"); SETP("DM_VK_PCACHE", "vk_pipeline_cache.bin"); SETG("DM_VK_PSO_SEED", "vk_pipelines_seed.bin");
-    snprintf(q, sizeof q, "%s/shaders.pak", g_game); if (!stat(q, &st)) setenv("DM_SPV_PAK", q, 0);   // the packed shader set, else vk/b-<chain>/
-    { snprintf(p, sizeof p, "%s/aoc", g_game); struct stat as; if (!stat(p, &as)) setenv("DM_AOC_DIR", p, 0); }   // the DLC the player owns (Shield: the Expansion Pass keys; its content is in the update)
+    char sp_pak[1300]; snprintf(sp_pak, sizeof sp_pak, "%s/shaders_%s.pak", g_game, tag);
+    if (!stat(sp_pak, &st)) setenv("DM_SPV_PAK", sp_pak, 1);
+    else { snprintf(q, sizeof q, "%s/shaders.pak", g_game); if (!stat(q, &st)) setenv("DM_SPV_PAK", q, 0); }
+    char aoc_tag[1300]; snprintf(aoc_tag, sizeof aoc_tag, "%s/aoc_%s", g_game, tag);
+    if (!stat(aoc_tag, &st)) setenv("DM_AOC_DIR", aoc_tag, 1);
+    else { snprintf(p, sizeof p, "%s/aoc", g_game); struct stat as; if (!stat(p, &as)) setenv("DM_AOC_DIR", p, 0); }
     SETP("DM_NVN_CAPTURE", "nvn_capture");   // shaders the game builds in memory, saved for the setup to translate (nvn_vk.c mtl_shader_seen)
-    SETG("DM_ROMFS", "RomFS"); SETG("DM_SPV_DIR", "vk"); SETG("DM_NVN_SHMAP", "shader_map.tsv"); SETG("DM_FONT_DIR", "font");
-    SETP("DM_SAVE", "save"); SETP("DM_TEMP", "temp");
+    SETG("DM_ROMFS", "RomFS"); SETG("DM_SPV_DIR", "vk");
+    char shm_tag[1300]; snprintf(shm_tag, sizeof shm_tag, "shader_map_%s.tsv", tag);
+    char shm_path[1300]; snprintf(shm_path, sizeof shm_path, "%s/%s", g_game, shm_tag);
+    if (!stat(shm_path, &st)) SETG("DM_NVN_SHMAP", shm_tag);
+    else SETG("DM_NVN_SHMAP", "shader_map.tsv");
+    SETG("DM_FONT_DIR", "font");
+    char save_tag[1300]; snprintf(save_tag, sizeof save_tag, "save_%s", tag);
+    char save_path[1300]; snprintf(save_path, sizeof save_path, "%s/%s", g_files, save_tag);
+    if (!stat(save_path, &st)) {
+        SETP("DM_SAVE", save_tag);
+    } else if (!strcmp(tag, "shield")) {
+        snprintf(p, sizeof p, "%s/save", g_files); mkdir(p, 0755);
+        SETP("DM_SAVE", "save");
+    } else {
+        mkdir(save_path, 0755);
+        SETP("DM_SAVE", save_tag);
+    }
+    SETP("DM_TEMP", "temp"); SETP("DM_MODS_DIR", "mods");
     // A save archive imported by SetupActivity is staged as save_import/. Rename the directories on the same
     // filesystem so nested save layouts survive and the old save remains intact if the import cannot be installed.
     { char imp[1200], old[1300]; struct stat is, ss;
       snprintf(imp, sizeof imp, "%s/save_import", g_files);
-      snprintf(p, sizeof p, "%s/save", g_files);
+      const char *cur_save = getenv("DM_SAVE");
+      if (cur_save && *cur_save) snprintf(p, sizeof p, "%s", cur_save);
+      else snprintf(p, sizeof p, "%s/save", g_files);
       if (!lstat(imp, &is) && S_ISDIR(is.st_mode)) {
           int moved_old = 0, can_install = 1;
           int save_status = stat(p, &ss);
@@ -331,6 +472,7 @@ static void host_start(void) {
           }
       } }
     snprintf(p, sizeof p, "%s/save", g_files); mkdir(p, 0755); snprintf(p, sizeof p, "%s/temp", g_files); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/mods", g_files); mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/RomFS", g_game);
     if (stat(p, &st)) { fprintf(stderr, "boot: game files not found: %s (install the bundle, or copy RomFS, patched, shaders.pak, shader_map.tsv and font there)\n", p); ALOG("game files missing in %s", g_files); return; }
     chdir(g_files);
@@ -395,15 +537,52 @@ static void *swapin_main(void *p) {
     return NULL;
 }
 static void swapin_start(void) { if (kb_of("/proc/self/status", "VmSwap:") < 32 * 1024) return; pthread_t t; if (!pthread_create(&t, NULL, swapin_main, NULL)) pthread_detach(t); }
-__attribute__((weak)) void nvn_vk_cache_save(void);   // the pipeline cache file (nvn_vk.c), written when the app goes to the background
+__attribute__((weak)) void nvn_vk_cache_save(void);   // the pipeline cache file (nvn_vk.c), written asynchronously when the app goes to the background
+__attribute__((weak)) void nvn_vk_window_term(void);  // tears down the Vulkan swapchain and surface before Android destroys the ANativeWindow
+static atomic_int g_cache_saving;
+static void *cache_save_main(void *p) { (void)p; if (nvn_vk_cache_save) nvn_vk_cache_save(); atomic_store(&g_cache_saving, 0); return NULL; }
+static void cache_save_async(void) {
+    if (!nvn_vk_cache_save || atomic_exchange(&g_cache_saving, 1)) return;
+    pthread_t t; if (pthread_create(&t, NULL, cache_save_main, NULL)) atomic_store(&g_cache_saving, 0); else pthread_detach(t);
+}
+// Memory pressure (Android's onTrimMemory, GameActivity.java; APP_CMD_LOW_MEMORY): the renderer returns the device memory blocks it no longer uses (nvn_vk.c nvn_vk_trim) and the
+// C allocator gives its free pages back (scudo's M_PURGE). Nothing the game holds is touched. Done on a thread of its own: the system's callback must not wait on the driver.
+// Levels: 5 running-moderate (ignored: nothing is short yet), 10 running-low, 15 running-critical, 20 UI hidden, 40+ in the background
+__attribute__((weak)) void nvn_vk_trim(void);
+static atomic_int g_trimming;
+static void *trim_main(void *p) {
+    (void)p; long before = kb_of("/proc/self/status", "VmRSS:");
+    if (nvn_vk_trim) nvn_vk_trim();
+#ifdef M_PURGE
+    mallopt(M_PURGE, 0);
+#endif
+    fprintf(stderr, "[mem] trim: resident %ld → %ld MB\n", before / 1024, kb_of("/proc/self/status", "VmRSS:") / 1024);
+    atomic_store(&g_trimming, 0); return NULL;
+}
+static void trim_memory(int level) {
+    if (level < 10 || !g_started || atomic_exchange(&g_trimming, 1)) return;
+    pthread_t t; if (pthread_create(&t, NULL, trim_main, NULL)) atomic_store(&g_trimming, 0); else pthread_detach(t);
+}
+JNIEXPORT void JNICALL Java_com_nxnative_GameActivity_nativeTrimMemory(JNIEnv *env, jclass c, jint level) { (void)env; (void)c; trim_memory((int)level); }   // GameActivity.java onTrimMemory
+// DM_FPS_TARGET 60..120: tells the compositor the window's frame rate so a 90 / 120 Hz phone switches its display to that mode (it otherwise stays on its 60 Hz game mode and drops frames).
+// Looked up at run time (ANativeWindow_setFrameRate* are API 30 / 31; the app's minSdk is 31); the change is allowed even when it is not seamless
+static void window_frame_rate(ANativeWindow *w) {
+    const char *e = getenv("DM_FPS_TARGET"); int fps = e ? atoi(e) : 0;
+    if (!w || fps < 60 || fps > 120) return;
+    int32_t (*strat)(ANativeWindow *, float, int8_t, int8_t) = (int32_t (*)(ANativeWindow *, float, int8_t, int8_t))dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRateWithChangeStrategy");
+    int32_t (*plain)(ANativeWindow *, float, int8_t) = (int32_t (*)(ANativeWindow *, float, int8_t))dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate");
+    int r = strat ? strat(w, (float)fps, 1 /* FIXED_SOURCE */, 1 /* CHANGE_FRAME_RATE_ALWAYS */) : plain ? plain(w, (float)fps, 1) : -1;
+    ALOG("window frame rate hint %d Hz: %d", fps, r);
+}
 static void on_cmd(struct android_app *app, int32_t cmd) {
     switch (cmd) {
-        case APP_CMD_INIT_WINDOW: atomic_store(&g_window, app->window); immersive(); host_start(); break;
-        case APP_CMD_TERM_WINDOW: atomic_store(&g_window, NULL); break;
+        case APP_CMD_INIT_WINDOW: atomic_store(&g_window, app->window); immersive(); host_start(); window_frame_rate(app->window); break;
+        case APP_CMD_TERM_WINDOW: atomic_store(&g_window, NULL); if (g_started && nvn_vk_window_term) nvn_vk_window_term(); break;
         case APP_CMD_GAINED_FOCUS: immersive(); if (g_started) { dm_focus_set(1); dm_audio_suspend(0); } break;
         case APP_CMD_LOST_FOCUS: if (g_started) { dm_focus_set(2); } break;
-        case APP_CMD_PAUSE: if (g_started) { dm_focus_set(3); dm_audio_suspend(1); if (nvn_vk_cache_save) nvn_vk_cache_save(); } break;
-        case APP_CMD_RESUME: if (g_started) { dm_focus_set(1); dm_audio_suspend(0); swapin_start(); } break;
+        case APP_CMD_LOW_MEMORY: trim_memory(15); break;
+        case APP_CMD_PAUSE: atomic_store(&g_paused, 1); if (g_started) { dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); cache_save_async(); } break;
+        case APP_CMD_RESUME: atomic_store(&g_paused, 0); if (g_started) { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(1); swapin_start(); } break;
     }
 }
 void android_main(struct android_app *app) {
