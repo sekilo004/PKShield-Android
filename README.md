@@ -1,15 +1,41 @@
-# PKShield Android
+# PKShield & PKSword Android
 
-**Pokémon Shield (Nintendo Switch, update 1.3.2) running natively on Android phones.** This is not emulation: the game's own ARM64 code runs
-directly on the phone's processor, rewritten only where Android requires it, and its graphics (NVN) are rebuilt on Vulkan.
+**Pokémon Shield & Pokémon Sword (Nintendo Switch, update 1.3.2) running natively on Android phones.** This is not emulation: the games' own ARM64 code runs
+directly on the phone's processor, rewritten only where Android requires it, and their graphics (NVN) are rebuilt on Vulkan.
 
 > [!WARNING]
-> **Beta.** Tested on a Samsung Galaxy S25+ (Snapdragon 8 Elite, Adreno 830) with Qualcomm's driver and with Mesa Turnip. Other phones are
+> **Beta.** Tested on a Samsung Galaxy S25+ (Snapdragon 8 Elite, Adreno 830) with Qualcomm's driver and with Mesa Turnip, as well as Adreno 6xx and 7xx devices. Other phones are
 > expected to work but have not been tested yet: reports are welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 > [!NOTE]
 > **No game files, compiled game code, shaders or keys are included, and none will be provided.** You need your own legally obtained dump of
-> Pokémon Shield (base game and update 1.3.2) and the `prod.keys` of your own console. Instructions on how to obtain them will not be provided.
+> Pokémon Shield or Pokémon Sword (base game and update 1.3.2) and the `prod.keys` of your own console. Instructions on how to obtain them will not be provided.
+
+## Features
+
+- **Dual-Version Support (Sword & Shield)**:
+  - Play either **Pokémon Shield** (`01008DB008C2C000`) or **Pokémon Sword** (`0100ABF008968000`), or both within a single app.
+  - **Shared Storage**: Common assets in RomFS (~95% of game data) are shared across versions to save 10–15 GB of phone storage; only version-specific modules, shaders (`shaders_sword.pak`, `shaders_shield.pak`), DLCs, and saves (`save_sword`, `save_shield`) are stored separately.
+  - **In-App Version Switcher**: Easily switch between Pokémon Sword and Pokémon Shield from the setup/launcher screen when both are installed.
+  - **Dedicated Shortcuts**: Separate pinned and dynamic home screen shortcuts for Pokémon Sword and Pokémon Shield with their respective official titles and icons.
+- **20:9 Ultrawide Aspect Ratio**:
+  - Native 20:9 3D camera viewport patch eliminates black side borders on modern smartphones without stretching or distorting 3D scene geometry.
+  - Toggle between 20:9 (fill) and 16:9 (fit) in Settings.
+- **60 FPS Support & Pacing**:
+  - Built-in 60 FPS patch (present interval 1 with adaptive step pacing) for smooth gameplay.
+  - Selectable framerate target (30 FPS or 60 FPS) in Settings.
+- **Physical Controller Button Remapping**:
+  - Custom button mapping configuration screen for Bluetooth and USB gamepads.
+  - Remap A, B, X, Y, D-pad, bumpers, triggers, stick buttons, and + / − buttons, with custom and default layout presets.
+- **Memory Optimizations & Trimming**:
+  - Reclaims unused Vulkan device memory blocks (`nvn_vk_trim`) and purges allocator pages (Scudo `M_PURGE`) upon Android memory pressure callbacks (`onTrimMemory`, `APP_CMD_LOW_MEMORY`).
+  - Proactive kernel unmapping with `MADV_DONTNEED` to prevent Low Memory Killer (LMK) crashes.
+- **CPU Thread Pinning**:
+  - Optional CPU affinity setting keeps game and rendering threads away from slow efficiency cores, directing work to high-performance cores.
+- **GPU Compatibility & Driver Switching**:
+  - Choose between the phone's system GPU driver or custom Vulkan drivers (Mesa Turnip via libadrenotools).
+  - Vulkan presentation modes: `mailbox` (lowest latency, tear-free), `fifo` (vsync locked), or `immediate`.
+  - Fixes and optimizations for Qualcomm Adreno 6xx, 7xx, and 8xx series GPUs.
 
 ## How it works
 
@@ -21,21 +47,21 @@ shaders translated to SPIR-V by Ryujinx's shader translator, on the phone, durin
 ## Install and play
 
 1. Install `PokemonShield.apk` (from the releases, or build it yourself: [docs/BUILDING.md](docs/BUILDING.md)) and open it.
-2. **Game files → Choose**: your `.nsp` / `.xci` files (base game, update 1.3.2, any DLC). **Keys → Choose**: your `prod.keys` (and
+2. **Game files → Choose**: your `.nsp` / `.xci` files for Pokémon Shield or Pokémon Sword (base game, update 1.3.2, any DLC). **Keys → Choose**: your `prod.keys` (and
    `title.keys` if your dump needs it). The keys stay in the app's private storage: never uploaded, never part of the APK.
 3. **Set up the game.** The phone unpacks the game, rewrites its code and translates its shaders. When it is done the app *is* the game: it
-   opens straight into it every time, and your dump files are no longer needed. A Pokémon Shield shortcut with the game's own icon (from your
-   dump) goes on the home screen.
+   opens straight into it every time, and your dump files are no longer needed. A shortcut with the game's own icon and title (Pokémon Shield or Pokémon Sword) goes on the home screen.
+4. **Dual setup (optional)**: Install the other game version at any time from Settings → **Set up second game**. The common RomFS files are reused automatically, taking only a fraction of the storage space.
 
-Long-press the app's icon for **Settings**: graphics, touch controls, the graphics driver, exporting your save data as a ZIP, or setting the game up again.
+Long-press the app's icon for **Settings**: graphics quality, aspect ratio, target FPS, controller button mapping, CPU pinning, touch controls, graphics driver, exporting/importing save data, or setting the game up again.
 A few shaders the game builds while it runs are saved the first time and added at the next start.
 If a file picker does not expose a path the app can read directly, the selected game file is copied into the app's storage; this needs free space for both the copy and the setup output.
 
 ## Requirements
 
-- Android 12 or newer, arm64, Vulkan 1.1 or newer with dynamic rendering (most phones from 2020 on; Vulkan 1.3 recommended), about 15 GB free.
-- **Adreno** (Snapdragon): tested. Qualcomm's driver or a custom one (Mesa Turnip) chosen in the app.
-- **Mali / PowerVR / Xclipse**: supported but untested. Textures these GPUs cannot sample (BC formats) are decoded as they load; on Mali
+- Android 12 or newer, arm64, Vulkan 1.1 or newer with dynamic rendering (most phones from 2020 on; Vulkan 1.3 recommended), about 15 GB free (shared for both versions).
+- **Adreno** (Snapdragon 6xx, 7xx, 8xx): tested. Qualcomm's driver or a custom one (Mesa Turnip) chosen in the app.
+- **Mali / PowerVR / Xclipse**: supported. Textures these GPUs cannot sample (BC formats) are decoded as they load; on Mali
   the framebuffers are set up to keep its compression (AFBC).
 
 ## Playing
@@ -44,9 +70,15 @@ If a file picker does not expose a path the app can read directly, the selected 
   Controls fade when untouched; touch anywhere to bring them back. Two fingers tapped together = B.
 - **Edit the layout** in game: hold − for 2 seconds, then drag to move, pinch to resize, double-tap to hide or show, hold + to reset,
   hold − again to save.
-- **Controllers**: connecting a Bluetooth / USB controller hides the touch controls; a pair of Joy-Cons plays as one controller.
-- **Settings**: graphics *High* (TV mode, 1080p), *Low* (handheld mode, 720p, for weaker phones) or *Auto* (High, switching to Low while the
-  phone is hot); touch controls opacity and fade time.
+- **Controllers**: connecting a Bluetooth / USB controller hides the touch controls; a pair of Joy-Cons plays as one controller. Map buttons in **Settings → Controller button mapping**.
+- **Settings**:
+  - **Graphics quality**: *High* (TV mode, 1080p), *Low* (handheld mode, 720p, for weaker phones) or *Auto* (High, switching to Low while the phone is hot).
+  - **Aspect ratio**: *20:9* (ultrawide, fills modern phone displays) or *Fit* (standard 16:9).
+  - **Target FPS**: *60 FPS* or *30 FPS*.
+  - **Presentation mode**: *Mailbox*, *FIFO*, or *Immediate*.
+  - **CPU thread pinning**: Keeps game threads prioritized on fast performance cores.
+  - **Touch controls**: Opacity and fade time.
+  - **Save management**: Export and import save data per version (`save_shield` / `save_sword`) as a ZIP.
 - **Logs** for bug reports: `Android/data/com.nxnative.pokemonshield/files/log.txt` (and `log.prev.txt` for the run before).
 
 ## Known gaps
@@ -71,5 +103,5 @@ If a file picker does not expose a path the app can read directly, the selected 
   domain), **Vulkan Headers** (Apache-2.0 / MIT), **DejaVu Sans** (the button icons' letters), Android **native_app_glue** (Apache-2.0).
 - **LASRecompAndroid** and **BOTWRecompAndroid**: ideas for Android presentation and CPU scheduling.
 
-Pokémon and Pokémon Shield are trademarks of Nintendo, Creatures Inc. and GAME FREAK inc. This project is not affiliated with or endorsed by
+Pokémon, Pokémon Shield, and Pokémon Sword are trademarks of Nintendo, Creatures Inc. and GAME FREAK inc. This project is not affiliated with or endorsed by
 Nintendo, The Pokémon Company, Creatures Inc. or GAME FREAK inc.
