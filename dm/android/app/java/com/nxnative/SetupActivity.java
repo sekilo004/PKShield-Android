@@ -421,6 +421,11 @@ public final class SetupActivity extends Activity {
         pin.setChecked("1".equals(envGet("DM_CPU_PIN")));
         pin.setOnCheckedChangeListener((b, on) -> envSet("DM_CPU_PIN", on ? "1" : ""));
         root.addView(pin);
+        android.widget.CheckBox prewarm = new android.widget.CheckBox(this); prewarm.setPadding(0, 16, 0, 0);
+        prewarm.setText(t("Precompile shaders at startup (eliminates in-game stutter / tirones)", "Precompilar shaders al iniciar (elimina tirones durante el juego)"));
+        prewarm.setChecked(!"0".equals(envGet("DM_PREWARM_STARTUP")));
+        prewarm.setOnCheckedChangeListener((b, on) -> envSet("DM_PREWARM_STARTUP", on ? "1" : "0"));
+        root.addView(prewarm);
         presentOptions(root);
         modsText = row(root, "Code patches (.pchtxt)", "Choose", v -> pick(PICK_MOD, true));
         button(root, "Clear code patches", v -> { deleteTree(modsDir()); modsDir(); refresh(); });

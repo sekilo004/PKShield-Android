@@ -33,6 +33,13 @@ directly on the phone's processor, rewritten only where Android requires it, and
 - **Physical Controller Button Remapping**:
   - Custom button mapping configuration screen for Bluetooth and USB gamepads.
   - Remap A, B, X, Y, D-pad, bumpers, triggers, stick buttons, and + / − buttons, with custom and default layout presets.
+- **Shader & Pipeline Precompiler (Anti-Stutter)**:
+  - **Startup Prewarm**: Pre-compiles Vulkan graphics pipelines (`VkPipeline`) before launching the game, preventing runtime compilation hitches and micro-stutter (*tirones*) during battles, animations, and world exploration.
+  - **Multi-Threaded Worker Pool**: Uses parallel worker threads (up to 6 CPU cores) to compile pipelines concurrently using Vulkan's thread-safe `VkPipelineCache`.
+  - **Bundled Pipeline Seeds**: Shipped with pre-recorded pipeline manifests (`vk_pipelines_seed.bin`, 1,172 unique pipeline configurations from real gameplay) for both Pokémon Shield and Pokémon Sword, eliminating stutter from the very first run.
+  - **Visual Startup Progress UI**: Displays an overlay with a progress bar, compiled count (`Compiling shaders... X / Y`), percentage indicator, and a "Skip" button to jump immediately into the game.
+  - **Dynamic Pipeline Caching**: Pipelines encountered during play are automatically saved to versioned caches (`vk_pipelines_sword.bin` / `vk_pipelines_shield.bin`) and driver cache files (`vk_pipeline_cache_*.bin`).
+  - **Configurable**: Can be enabled or disabled anytime in Settings (**Precompile shaders at startup** / `DM_PREWARM_STARTUP`).
 - **Memory Optimizations & Trimming**:
   - Reclaims unused Vulkan device memory blocks (`nvn_vk_trim`) and purges allocator pages (Scudo `M_PURGE`) upon Android memory pressure callbacks (`onTrimMemory`, `APP_CMD_LOW_MEMORY`).
   - Proactive kernel unmapping with `MADV_DONTNEED` to prevent Low Memory Killer (LMK) crashes.
@@ -83,6 +90,7 @@ If a file picker does not expose a path the app can read directly, the selected 
   - **Target FPS**: *60 FPS* or *30 FPS*.
   - **Presentation mode**: *Mailbox*, *FIFO*, or *Immediate*.
   - **CPU thread pinning**: Keeps game threads prioritized on fast performance cores.
+  - **Shader precompilation**: Toggle startup pipeline precompilation on/off (`DM_PREWARM_STARTUP`).
   - **Touch controls**: Opacity and fade time.
   - **Save management**: Export and import save data per version (`save_shield` / `save_sword`) as a ZIP.
 - **Logs** for bug reports: `Android/data/com.nxnative.pokemonshield/files/log.txt` (and `log.prev.txt` for the run before).

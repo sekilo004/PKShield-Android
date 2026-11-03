@@ -73,7 +73,7 @@ def migrate_legacy_install(game_dir, incoming_tag):
     inc_ready = os.path.join(game_dir, f'ready_{incoming_tag}')
     legacy_ready = os.path.join(game_dir, 'ready')
     if os.path.isfile(legacy_ready) and not os.path.isfile(other_ready) and not os.path.isfile(inc_ready):
-        for base, ext in [('shaders', '.pak'), ('shader_map', '.tsv'), ('ready', ''), ('icon', '.jpg')]:
+        for base, ext in [('shaders', '.pak'), ('shader_map', '.tsv'), ('vk_pipelines_seed', '.bin'), ('ready', ''), ('icon', '.jpg')]:
             src = os.path.join(game_dir, base + ext)
             dst = os.path.join(game_dir, f'{base}_{other_tag}{ext}')
             if os.path.isfile(src) and not os.path.isfile(dst):
@@ -238,6 +238,19 @@ def main():
                              str(PROFILE.table('shader_map.tsv')),
                              shmap)
     shutil.copyfile(shmap, shmap_ver)
+    seed_src = os.path.join(os.path.dirname(str(PROFILE.table('shader_map.tsv'))), 'vk_pipelines_seed.bin')
+    if not os.path.isfile(seed_src):
+        pso_tsv = os.path.join(os.path.dirname(str(PROFILE.table('shader_map.tsv'))), 'pso_manifest.tsv')
+        if os.path.isfile(pso_tsv):
+            try:
+                sys.path.insert(0, HERE)
+                import make_pso_seed
+                make_pso_seed.convert_manifest(pso_tsv, seed_src)
+            except Exception as e:
+                log.write(f'could not build pipeline seed: {e}\n')
+    if os.path.isfile(seed_src):
+        shutil.copyfile(seed_src, os.path.join(a.out, 'vk_pipelines_seed.bin'))
+        shutil.copyfile(seed_src, os.path.join(a.out, f'vk_pipelines_seed_{tag}.bin'))
     font = os.path.join(a.out, 'font'); os.makedirs(font, exist_ok=True)
     std = a.std_font or next((f for f in ('/system/fonts/Roboto-Regular.ttf', '/system/fonts/NotoSans-Regular.ttf') if os.path.isfile(f)), None)
     if std: shutil.copyfile(std, os.path.join(font, 'standard.ttf'))

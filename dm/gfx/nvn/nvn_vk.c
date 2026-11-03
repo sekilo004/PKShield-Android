@@ -137,6 +137,15 @@ static void dummies_init(void);
 static int host_import_mark(int set); // (queue_submit)
 static void pcache_open(void);
 static void *prewarm_main(void *arg); // pipeline list and cache (below)
+static _Atomic int g_prewarm_total = 0;
+static _Atomic int g_prewarm_done = 0;
+static _Atomic int g_prewarm_running = 0;
+static _Atomic int g_prewarm_complete = 0;
+static _Atomic int g_prewarm_cancel = 0;
+static _Atomic int g_prewarm_work_idx = 0;
+int nvn_vk_prewarm_status(int *done, int *total);
+void nvn_vk_prewarm_cancel(void);
+void nvn_vk_prewarm_wait(void);
 // The Vulkan driver: DM_VK_DRIVER=<folder>/<library> (an Adreno driver such as
 // Mesa Turnip, chosen on the setup screen) is opened through libadrenotools
 // (BSD-2-Clause, shipped in the app with its hook libraries); without it, or
@@ -535,9 +544,13 @@ void mtl_init(void) {
   dummies_init();
   pcache_open();
   if (getenv("DM_VK_PSO_SEED") || getenv("DM_VK_PSO_RECORD")) {
+    atomic_store(&g_prewarm_running, 1);
+    atomic_store(&g_prewarm_complete, 0);
     pthread_t t;
     if (!pthread_create(&t, NULL, prewarm_main, NULL))
       pthread_detach(t);
+    else
+      atomic_store(&g_prewarm_running, 0);
   }
 }
 
@@ -4915,86 +4928,172 @@ static long mem_avail_mb(void) {
   return -1;
 #endif
 }
-static void prewarm_pace(int i, uint64_t dt_ns, int *waits) {
-  if (dt_ns > 500000ull)
-    usleep(2000); // cached pipelines instantiate in microseconds and need no
-                  // sleep; real compiles yield briefly
-  if (i % 8)
-    return;
-  static long floor_mb = -1;
-  if (floor_mb < 0) {
-    const char *e = getenv("DM_VK_PREWARM_MIN_MB");
-    floor_mb = e ? atol(e) : 1536;
-  }
-  for (int k = 0; k < 600; k++) {
-    long m = mem_avail_mb();
-    if (m < 0 || m >= floor_mb)
-      break;
-    if (!k)
-      (*waits)++;
-    usleep(100000);
-  } // at most a minute per wait
+// Multi-threaded pipeline prewarmer: compiles all known pipelines (seed list + user record)
+// across multiple CPU cores into VkPipelineCache before or during startup, eliminating
+// in-game shader compilation stutters (tirones).
+
+int nvn_vk_prewarm_status(int *done, int *total) {
+  if (done)
+    *done = atomic_load(&g_prewarm_done);
+  if (total)
+    *total = atomic_load(&g_prewarm_total);
+  return atomic_load(&g_prewarm_complete);
 }
-static void *prewarm_main(void *arg) {
-  (void)arg;
-  uint64_t t0 = mono_ns();
-  int waits = 0;
-  pso_rec *rs = NULL;
-  int n = 0;
-  int ns = pso_rec_load(getenv("DM_VK_PSO_SEED"), &rs, &n),
-      nr = pso_rec_load(getenv("DM_VK_PSO_RECORD"), &rs, &n);
-  if (!n)
-    return NULL;
-  static nvn_hmap progs = {.klen = 40};
-  static nvn_hmap seen = {.klen = sizeof(pso_rec)};
-  int built = 0, had = 0, failed = 0, noshader = 0;
-  for (int i = 0; i < n; i++) {
-    if (nvn_hm_get(&seen, &rs[i]))
-      continue;
-    nvn_hm_put(&seen, &rs[i], (void *)1);
-    vprog *pr = nvn_hm_get(&progs, rs[i].key);
+
+void nvn_vk_prewarm_cancel(void) {
+  atomic_store(&g_prewarm_cancel, 1);
+}
+
+void nvn_vk_prewarm_wait(void) {
+  while (atomic_load(&g_prewarm_running) && !atomic_load(&g_prewarm_complete) &&
+         !atomic_load(&g_prewarm_cancel)) {
+    usleep(10000);
+  }
+}
+
+typedef struct {
+  pso_rec *rs;
+  int n;
+  nvn_hmap *progs;
+  pthread_mutex_t *progs_mu;
+  _Atomic int *built;
+  _Atomic int *had;
+  _Atomic int *failed;
+  _Atomic int *noshader;
+} prewarm_worker_ctx;
+
+static void *prewarm_worker(void *arg) {
+  prewarm_worker_ctx *c = (prewarm_worker_ctx *)arg;
+  while (!atomic_load(&g_prewarm_cancel)) {
+    int i = atomic_fetch_add(&g_prewarm_work_idx, 1);
+    if (i >= c->n)
+      break;
+
+    pthread_mutex_lock(c->progs_mu);
+    vprog *pr = nvn_hm_get(c->progs, c->rs[i].key);
     if (!pr) {
       pr = calloc(1, sizeof *pr);
       int ok = 1;
       for (int st = 0; st < 5; st++) {
         static const uint8_t z[8];
-        if (!memcmp(rs[i].key[st], z, 8))
+        if (!memcmp(c->rs[i].key[st], z, 8))
           continue;
-        pr->sh[st] = shader_get(rs[i].key[st], st);
+        pr->sh[st] = shader_get(c->rs[i].key[st], st);
         if (!pr->sh[st])
           ok = 0;
       }
       if (!ok || !pr->sh[0]) {
         free(pr);
-        noshader++;
+        pthread_mutex_unlock(c->progs_mu);
+        atomic_fetch_add(c->noshader, 1);
+        atomic_fetch_add(&g_prewarm_done, 1);
         continue;
       }
-      nvn_hm_put(&progs, rs[i].key, pr);
+      nvn_hm_put(c->progs, c->rs[i].key, pr);
     }
-    pkey k = rs[i].k;
+    prog_layout(pr, 0);
+    pthread_mutex_unlock(c->progs_mu);
+
+    pkey k = c->rs[i].k;
     for (int st = 0; st < 5; st++)
       k.sh[st] = pr->sh[st];
-    prog_layout(pr, 0);
+
     pthread_mutex_lock(&g_psomu);
     int have = nvn_hm_get(&g_pso, &k) != NULL;
     pthread_mutex_unlock(&g_psomu);
     if (have) {
-      had++;
+      atomic_fetch_add(c->had, 1);
+      atomic_fetch_add(&g_prewarm_done, 1);
       continue;
     }
-    uint64_t pt0 = mono_ns();
+
     if (pso_lookup(pr, &k, 0))
-      built++;
+      atomic_fetch_add(c->built, 1);
     else
-      failed++;
-    prewarm_pace(built + failed, mono_ns() - pt0, &waits);
+      atomic_fetch_add(c->failed, 1);
+
+    atomic_fetch_add(&g_prewarm_done, 1);
   }
-  VLOG("prewarm: %d pipelines listed (%d shipped, %d recorded here): %d built, "
-       "%d already there, %d failed, %d with a shader missing, %.1f s (paused "
-       "%d times for low memory)",
-       n, ns, nr, built, had, failed, noshader, (mono_ns() - t0) / 1e9, waits);
+  return NULL;
+}
+
+static void *prewarm_main(void *arg) {
+  (void)arg;
+  uint64_t t0 = mono_ns();
+  pso_rec *rs = NULL;
+  int n = 0;
+  int ns = pso_rec_load(getenv("DM_VK_PSO_SEED"), &rs, &n);
+  int nr = pso_rec_load(getenv("DM_VK_PSO_RECORD"), &rs, &n);
+  if (!n) {
+    atomic_store(&g_prewarm_complete, 1);
+    atomic_store(&g_prewarm_running, 0);
+    return NULL;
+  }
+
+  // Deduplicate pipeline list upfront
+  nvn_hmap seen = {.klen = sizeof(pso_rec)};
+  pso_rec *unique_rs = malloc(sizeof(pso_rec) * (size_t)n);
+  int unique_n = 0;
+  for (int i = 0; i < n; i++) {
+    if (nvn_hm_get(&seen, &rs[i]))
+      continue;
+    nvn_hm_put(&seen, &rs[i], (void *)1);
+    unique_rs[unique_n++] = rs[i];
+  }
   free(rs);
+
+  atomic_store(&g_prewarm_total, unique_n);
+  atomic_store(&g_prewarm_done, 0);
+  atomic_store(&g_prewarm_work_idx, 0);
+  atomic_store(&g_prewarm_running, 1);
+  atomic_store(&g_prewarm_complete, 0);
+  atomic_store(&g_prewarm_cancel, 0);
+
+  static nvn_hmap progs = {.klen = 40};
+  pthread_mutex_t progs_mu = PTHREAD_MUTEX_INITIALIZER;
+  _Atomic int built = 0, had = 0, failed = 0, noshader = 0;
+
+  prewarm_worker_ctx ctx = {
+      .rs = unique_rs,
+      .n = unique_n,
+      .progs = &progs,
+      .progs_mu = &progs_mu,
+      .built = &built,
+      .had = &had,
+      .failed = &failed,
+      .noshader = &noshader};
+
+  int nworkers = 4;
+#ifdef _SC_NPROCESSORS_ONLN
+  long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpus > 1)
+    nworkers = (int)cpus - 1;
+  if (nworkers > 6)
+    nworkers = 6;
+  if (nworkers < 2)
+    nworkers = 2;
+#endif
+
+  pthread_t workers[6];
+  for (int w = 0; w < nworkers; w++) {
+    if (pthread_create(&workers[w], NULL, prewarm_worker, &ctx)) {
+      workers[w] = 0;
+    }
+  }
+  for (int w = 0; w < nworkers; w++) {
+    if (workers[w])
+      pthread_join(workers[w], NULL);
+  }
+
+  free(unique_rs);
   pcache_save();
+  atomic_store(&g_prewarm_complete, 1);
+  atomic_store(&g_prewarm_running, 0);
+
+  VLOG("prewarm: %d unique pipelines (%d shipped, %d recorded): %d built, "
+       "%d already cached, %d failed, %d with missing shader, in %.2f s using %d threads",
+       unique_n, ns, nr, atomic_load(&built), atomic_load(&had),
+       atomic_load(&failed), atomic_load(&noshader), (mono_ns() - t0) / 1e9, nworkers);
   return NULL;
 }
 // Builds the pipeline for key k (no lookup: pso_get and the prewarm do that)

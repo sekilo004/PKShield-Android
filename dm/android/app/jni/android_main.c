@@ -421,7 +421,16 @@ static void host_start(void) {
     { char m[4]; snprintf(m, sizeof m, "%d", DM_GAME_ANDROID_OPMODE); setenv("DM_OPMODE", m, 0); }   // the profile's android_op_mode (env.txt DM_OPMODE wins)
 #endif   // real sound output (AAudio, compat/aaudio_unit.c); env.txt can set 0
     // pipelines: every one the game makes is recorded here and built ahead at the next start, the list shipped with the game too, and the driver's compiled code kept
-    SETP("DM_VK_PSO_RECORD", "vk_pipelines.bin"); SETP("DM_VK_PCACHE", "vk_pipeline_cache.bin"); SETG("DM_VK_PSO_SEED", "vk_pipelines_seed.bin");
+    char pso_rec_name[64], pcache_name[64], pso_seed_name[64];
+    snprintf(pso_rec_name, sizeof pso_rec_name, "vk_pipelines_%s.bin", tag);
+    snprintf(pcache_name, sizeof pcache_name, "vk_pipeline_cache_%s.bin", tag);
+    snprintf(pso_seed_name, sizeof pso_seed_name, "vk_pipelines_seed_%s.bin", tag);
+    SETP("DM_VK_PSO_RECORD", pso_rec_name);
+    SETP("DM_VK_PCACHE", pcache_name);
+    char pso_seed_path[1300];
+    snprintf(pso_seed_path, sizeof pso_seed_path, "%s/%s", g_game, pso_seed_name);
+    if (!stat(pso_seed_path, &st)) SETG("DM_VK_PSO_SEED", pso_seed_name);
+    else SETG("DM_VK_PSO_SEED", "vk_pipelines_seed.bin");
     char sp_pak[1300]; snprintf(sp_pak, sizeof sp_pak, "%s/shaders_%s.pak", g_game, tag);
     if (!stat(sp_pak, &st)) setenv("DM_SPV_PAK", sp_pak, 1);
     else { snprintf(q, sizeof q, "%s/shaders.pak", g_game); if (!stat(q, &st)) setenv("DM_SPV_PAK", q, 0); }
@@ -507,7 +516,16 @@ void front_frame_work(uint64_t busy_ns, uint64_t target_ns) {
     if (busy_ns) p_hint_report(g_hint, (int64_t)busy_ns);
 }
 // The host's front_run (main.c): the guest already runs on our big-stack host thread
-void front_run(void (*guest)(void)) { guest(); }
+extern void mtl_init(void);
+extern void nvn_vk_prewarm_wait(void);
+void front_run(void (*guest)(void)) {
+    const char *pre = getenv("DM_PREWARM_STARTUP");
+    if (!pre || strcmp(pre, "0") != 0) {
+        mtl_init();
+        nvn_vk_prewarm_wait();
+    }
+    guest();
+}
 
 // The system bars hidden (app/java/com/nxnative/Immersive.java), from the app's event thread (an ordinary thread, attached to Java once and kept attached)
 static void immersive(void) {
@@ -564,6 +582,25 @@ static void trim_memory(int level) {
     pthread_t t; if (pthread_create(&t, NULL, trim_main, NULL)) atomic_store(&g_trimming, 0); else pthread_detach(t);
 }
 JNIEXPORT void JNICALL Java_com_nxnative_GameActivity_nativeTrimMemory(JNIEnv *env, jclass c, jint level) { (void)env; (void)c; trim_memory((int)level); }   // GameActivity.java onTrimMemory
+
+extern int nvn_vk_prewarm_status(int *done, int *total);
+extern void nvn_vk_prewarm_cancel(void);
+
+JNIEXPORT jboolean JNICALL Java_com_nxnative_GameActivity_nativeGetPrewarmStatus(JNIEnv *env, jclass c, jintArray out) {
+    (void)c;
+    int done = 0, total = 0;
+    int fin = nvn_vk_prewarm_status(&done, &total);
+    if (out && (*env)->GetArrayLength(env, out) >= 2) {
+        jint vals[2] = { (jint)done, (jint)total };
+        (*env)->SetIntArrayRegion(env, out, 0, 2, vals);
+    }
+    return (jboolean)(fin != 0);
+}
+
+JNIEXPORT void JNICALL Java_com_nxnative_GameActivity_nativeCancelPrewarm(JNIEnv *env, jclass c) {
+    (void)env; (void)c;
+    nvn_vk_prewarm_cancel();
+}
 // DM_FPS_TARGET 60..120: tells the compositor the window's frame rate so a 90 / 120 Hz phone switches its display to that mode (it otherwise stays on its 60 Hz game mode and drops frames).
 // Looked up at run time (ANativeWindow_setFrameRate* are API 30 / 31; the app's minSdk is 31); the change is allowed even when it is not seamless
 static void window_frame_rate(ANativeWindow *w) {
