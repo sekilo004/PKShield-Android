@@ -3,6 +3,12 @@
 **Pokémon Shield & Pokémon Sword (Nintendo Switch, update 1.3.2) running natively on Android phones.** This is not emulation: the games' own ARM64 code runs
 directly on the phone's processor, rewritten only where Android requires it, and their graphics (NVN) are rebuilt on Vulkan.
 
+> [!IMPORTANT]
+> **Fork Notice & Disclaimer:** This project is a personal fork of the original repository:
+> **https://github.com/simipoB/PKShield-Android**
+>
+> The modifications and additional features here were implemented strictly as a personal project. The code does not adhere to strict C/C++ standards, and features have not been 100% thoroughly verified across devices. As a result, this fork may contain significant bugs and regressions that are **completely unknown to the original developer**. Please **do not report issues from this fork to the upstream repository or the original author**.
+
 > [!WARNING]
 > **Beta.** Tested on a Samsung Galaxy S25+ (Snapdragon 8 Elite, Adreno 830) with Qualcomm's driver and with Mesa Turnip, as well as Adreno 6xx and 7xx devices. Other phones are
 > expected to work but have not been tested yet: reports are welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)).
